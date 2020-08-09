@@ -3,57 +3,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
-class scaled_dot_product_attention(nn.Module):
-    def __init__(self):
-        super(scaled_dot_product_attention, self).__init__()
-
-    def forward(self, Q, K, V, scale=None, self_mask=True):
-        attention = torch.bmm(Q, K.permute(0, 2, 1))
-        reg_atten = (attention ** 2).mean()
-        if scale:
-            attention = attention * scale
-        if self_mask:
-            mask = torch.eye(attention.size(1), attention.size(2))
-            mask = mask.unsqueeze(0).expand([attention.size(0), mask.size(0), mask.size(1)])
-            attention.masked_fill_(mask=mask.bool(), value=-1e9)
-        attention = F.softmax(attention, dim=-1)
-        context = torch.bmm(attention, V)
-        return context, reg_atten
-
-
 class multi_head_attention(nn.Module):
-    def __init__(self, head_num, model_dim):
+    def __init__(self, head_num, model_dim, num_agent):
         super(multi_head_attention, self).__init__()
         self.head_num = head_num
         self.model_dim = model_dim
         self.head_dim = self.model_dim // self.head_num
+        self.num_agent = num_agent
 
-        self.Q_proj = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim, bias=False),
-        )
-        self.K_proj = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim, bias=False),
-        )
-        self.V_proj = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim),
+        self.Q_projs = nn.ModuleList(nn.Sequential(
+            nn.Linear(self.model_dim, self.head_dim, bias=False),
+        ) for _ in range(self.head_num))
+        self.K_projs = nn.ModuleList(nn.Sequential(
+            nn.Linear(self.model_dim, self.head_dim, bias=False),
+        ) for _ in range(self.head_num))
+        self.V_projs = nn.ModuleList(nn.Sequential(
+            nn.Linear(self.model_dim, self.head_dim),
             nn.LeakyReLU()
-        )
-        self.attention = scaled_dot_product_attention()
+        ) for _ in range(self.head_num))
 
-    def forward(self, sa_input, s_input):
-        Q = self.Q_proj(s_input)
-        K = self.K_proj(sa_input)
-        V = self.V_proj(sa_input)
-        Q = Q.view(Q.size(0), -1, self.head_num, self.head_dim).transpose(1, 2)
-        Q = Q.contiguous().view(Q.size(0) * self.head_num, -1, self.head_dim)
-        K = K.view(K.size(0), -1, self.head_num, self.head_dim).transpose(1, 2)
-        K = K.contiguous().view(K.size(0) * self.head_num, -1, self.head_dim)
-        V = V.view(V.size(0), -1, self.head_num, self.head_dim).transpose(1, 2)
-        V = V.contiguous().view(V.size(0) * self.head_num, -1, self.head_dim)
-        scale = K.size(-1) ** -0.5
+    def forward(self, sa_inputs, s_inputs):
+        all_qs = [[head(s_input) for s_input in s_inputs] for head in self.Q_projs]
+        all_ks = [[head(sa_input) for sa_input in sa_inputs] for head in self.K_projs]
+        all_vs = [[head(sa_input) for sa_input in sa_inputs] for head in self.V_projs]
+        scale = self.head_dim ** -0.5
 
-        context, reg_atten = self.attention.forward(Q, K, V, scale=scale)
-        context = context.view(sa_input.size(0), self.head_num, -1, self.head_dim).transpose(1, 2)
-        context = context.contiguous().view(sa_input.size(0), -1, self.model_dim)
-        return context, reg_atten
+        all_atten_values = [[] for _ in range(self.num_agent)]
+        reg_atten = 0
+        for cur_head_qs, cur_head_vs, cur_head_ks in zip(all_qs, all_vs, all_ks):
+            for agent_idx, q in zip(range(self.num_agent), cur_head_qs):
+                ks = [k for idx, k in enumerate(cur_head_ks) if idx != agent_idx]
+                vs = [v for idx, v in enumerate(cur_head_vs) if idx != agent_idx]
+                logits = torch.matmul(q.view(q.size(0), 1, -1), torch.stack(ks).permute(1, 2, 0))
+                scale_logits = scale * logits
+                scale_dot_product = F.softmax(scale_logits, dim=2)
+                other_values = (scale_dot_product * torch.stack(vs).permute(1, 2, 0)).sum(dim=2)
+                all_atten_values[agent_idx].append(other_values)
+                reg_atten += logits.mean() * 1e-3
+        return all_atten_values, reg_atten
