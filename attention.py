@@ -29,7 +29,7 @@ class multi_head_attention(nn.Module):
         scale = self.head_dim ** -0.5
 
         all_atten_values = [[] for _ in range(self.num_agent)]
-        reg_atten = 0
+        all_atten_logits = [[] for _ in range(self.num_agent)]
         for cur_head_qs, cur_head_vs, cur_head_ks in zip(all_qs, all_vs, all_ks):
             for agent_idx, q in zip(range(self.num_agent), cur_head_qs):
                 ks = [k for idx, k in enumerate(cur_head_ks) if idx != agent_idx]
@@ -39,5 +39,9 @@ class multi_head_attention(nn.Module):
                 scale_dot_product = F.softmax(scale_logits, dim=2)
                 other_values = (scale_dot_product * torch.stack(vs).permute(1, 2, 0)).sum(dim=2)
                 all_atten_values[agent_idx].append(other_values)
-                reg_atten += logits.mean() * 1e-3
+                all_atten_logits.append(logits)
+        reg_atten = []
+        for i in range(self.num_agent):
+            attend_mag_reg = 1e-3 * sum((logit**2).mean() for logit in all_atten_logits[i])
+            reg_atten.append(attend_mag_reg)
         return all_atten_values, reg_atten

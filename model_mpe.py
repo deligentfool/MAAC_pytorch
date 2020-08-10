@@ -6,14 +6,13 @@ from critic import attention_critic
 import numpy as np
 from buffer import replay_buffer
 from make_env import make_env
-import argparse
 import os
 import random
 from gym.spaces.discrete import Discrete
 from gym.spaces.box import Box
+import time
 
-
-class maac(object):
+class maac_mpe(object):
     def __init__(self, env_id, batch_size, learning_rate, exploration, episode, gamma, alpha, capacity, rho, update_iter, update_every, head_dim, traj_len, render):
         self.env_id = env_id
         #self.env = make_env(self.env_id, discrete_action=True)
@@ -60,23 +59,26 @@ class maac(object):
             target_param.detach().copy_(param.detach() * (1 - self.rho) + target_param.detach() * self.rho)
 
     def train(self):
-        observations, actions, rewards, next_observations, dones = self.buffer.sample(self.batch_size)
-
-        indiv_observations = [torch.FloatTensor(np.vstack([observations[b][n] for b in range(self.batch_size)])) for n in range(self.env.n)]
-        indiv_actions = [torch.FloatTensor([actions[b][n] for b in range(self.batch_size)]) for n in range(self.env.n)]
-        one_hot_indiv_actions = [torch.zeros(self.batch_size, self.action_dims[n]) for n in range(self.env.n)]
-        one_hot_indiv_actions =[one_hot_indiv_actions[n].scatter(dim=1, index=indiv_actions[n].unsqueeze(1).long(), value=1) for n in range(self.env.n)]
-        rewards = torch.FloatTensor(rewards)
-        indiv_rewards = [rewards[:, n] for n in range(self.env.n)]
-        indiv_next_observations = [torch.FloatTensor(np.vstack([next_observations[b][n] for b in range(self.batch_size)])) for n in range(self.env.n)]
-        dones = torch.FloatTensor(dones)
-        indiv_dones = [dones[:, n] for n in range(self.env.n)]
         for _ in range(self.update_iter):
+            observations, actions, rewards, next_observations, dones = self.buffer.sample(self.batch_size)
 
+            indiv_observations = [torch.FloatTensor(np.vstack([observations[b][n] for b in range(self.batch_size)])) for n in range(self.env.n)]
+            indiv_actions = [torch.FloatTensor([actions[b][n] for b in range(self.batch_size)]) for n in range(self.env.n)]
+            one_hot_indiv_actions = [torch.zeros(self.batch_size, self.action_dims[n]) for n in range(self.env.n)]
+            one_hot_indiv_actions =[one_hot_indiv_actions[n].scatter(dim=1, index=indiv_actions[n].unsqueeze(1).long(), value=1) for n in range(self.env.n)]
+            rewards = torch.FloatTensor(rewards)
+            indiv_rewards = [rewards[:, n] for n in range(self.env.n)]
+            indiv_next_observations = [torch.FloatTensor(np.vstack([next_observations[b][n] for b in range(self.batch_size)])) for n in range(self.env.n)]
+            dones = torch.FloatTensor(dones)
+            indiv_dones = [dones[:, n] for n in range(self.env.n)]
+
+            # * many times to train for same batch trajectories
+            # * Critic training
             one_hot_next_actions = []
             next_actions = []
             next_log_policies = []
             for i in range(self.env.n):
+                # * sampling all actions, a, from all agents’ current policies in order to calculate the gradient estimate for agent i
                 next_action, next_log_policy = self.target_policy_nets[i].forward(indiv_next_observations[i], log=True)
                 next_log_policies.append(next_log_policy)
                 next_actions.append(next_action)
@@ -87,23 +89,20 @@ class maac(object):
             q, reg_atten = self.value_net.forward(indiv_observations, one_hot_indiv_actions, reg=True)
             value_loss = 0
             for i in range(self.env.n):
-                # * calculate the expectation directly
+                # * soft operation: - self.alphas[i] * next_log_policies[i]
                 target_q = indiv_rewards[i].unsqueeze(1) + (1 - indiv_dones[i].unsqueeze(1)) * self.gamma * next_q[i] - self.alphas[i] * next_log_policies[i]
                 target_q = target_q.detach()
-
                 value_loss += (q[i] - target_q).pow(2).mean()
-
-            value_loss += reg_atten
+            for reg_a in reg_atten:
+                value_loss += reg_a
             self.value_optimizer.zero_grad()
             value_loss.backward()
+            # * scale the shared parameters' grad
             for p in self.value_net.get_shared_parameters():
                 p.grad.data.mul_(1. / self.env.n)
             nn.utils.clip_grad_norm_(self.value_net.parameters(), 10 * self.env.n)
             self.value_optimizer.step()
 
-            self.soft_value_update()
-
-        for _ in range(self.update_iter):
             one_hot_sample_actions = []
             sample_actions = []
             log_policies = []
@@ -111,7 +110,7 @@ class maac(object):
             all_policies = []
             reg_policies = []
             for i in range(self.env.n):
-                #dist = torch.distributions.Categorical(cur_policy)
+                # * sampling all actions, a, from all agents’ current policies in order to calculate the gradient estimate for agent i
                 sample_action, reg_policy, log_policy, entropy, all_policy  = self.policy_nets[i].forward(indiv_observations[i], explore=True, log=True, reg=True, entropy=True, all=True)
                 sample_actions.append(sample_action)
                 reg_policies.append(reg_policy)
@@ -125,10 +124,11 @@ class maac(object):
             q, all_q = self.value_net(indiv_observations, one_hot_sample_actions, all=True)
             for i in range(self.env.n):
                 b = torch.sum(all_policies[i] * all_q[i], dim=1, keepdim=True).detach()
+                # * COMA
                 adv = (q[i] - b).detach()
+                # * soft operation: self.alphas[i] * log_policies[i]
                 policy_loss = log_policies[i] * (self.alphas[i] * log_policies[i] - adv).detach()
                 policy_loss = policy_loss.mean() + reg_policies[i] * 1e-3
-                #policy_loss = policy_loss.mean()
 
                 self.policy_optimizers[i].zero_grad()
                 for p in self.value_net.parameters():
@@ -139,6 +139,8 @@ class maac(object):
                 nn.utils.clip_grad_norm_(self.policy_nets[i].parameters(), 0.5)
                 self.policy_optimizers[i].step()
 
+            self.soft_value_update()
+            for i in range(self.env.n):
                 self.soft_policy_update(i)
 
     def run(self):
@@ -170,7 +172,7 @@ class maac(object):
                 total_reward = [tr + r for tr, r in zip(total_reward, reward)]
                 obs = next_obs
 
-                if (self.count % self.update_every) == 0 and epi >= self.exploration:
+                if (self.count % self.update_every) == 0 and epi >= self.exploration and self.batch_size <= len(self.buffer):
                     self.train_count += 1
                     self.train()
                 if self.count % self.traj_len == 0:
@@ -185,37 +187,32 @@ class maac(object):
                         for i in range(self.env.n):
                             torch.save(self.policy_nets[i], './models/{}/policy{}.pkl'.format(self.env_id, i))
                         max_reward = sum(weight_reward)
-                    print(('episode: {}\ttrain_count:{}\tweight_reward:' + '{:.2f}\t' * self.env.n + 'sum:{:.2f}').format(epi + 1, self.train_count, *weight_reward, sum(weight_reward)))
+                    print(('episode: {}\ttrain_count:{}\tweight_reward:' + '{:.1f}\t' * self.env.n + 'sum:{:.1f}').format(epi + 1, self.train_count, *weight_reward, sum(weight_reward)))
                     break
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-s",
-        "--scenario",
-        help="set the scenario.",
-        type=str,
-        #default='fullobs_collect_treasure'
-        default='simple_tag'
-    )
-    args = parser.parse_args()
-    env_id = args.scenario
-    os.makedirs('./models/{}'.format(env_id), exist_ok=True)
-    # * the size of replay buffer must be appropriate
-    test = maac(
-        env_id=env_id,
-        batch_size=1024,
-        learning_rate=1e-3,
-        exploration=100,
-        episode=50000,
-        gamma=0.99,
-        alpha=0.01,
-        capacity=1000000,
-        rho=0.999,
-        update_iter=4,
-        update_every=100,
-        head_dim=32,
-        traj_len=25,
-        render=False
-    )
-    test.run()
+    def eval(self, render=True):
+        self.count = 0
+        for i in range(self.env.n):
+            self.policy_nets[i] = torch.load('./models/{}/policy{}.pkl'.format(self.env_id, i))
+        while True:
+            obs = self.env.reset()
+            total_reward = [0 for i in range(self.env.n)]
+            if render:
+                self.env.render()
+            while True:
+                time.sleep(0.05)
+                actions = []
+                for n in range(self.env.n):
+                    action = np.zeros(self.action_dims[i])
+                    action_idx = self.policy_nets[i].forward(torch.FloatTensor(np.expand_dims(obs[i], 0)), explore=True).item()
+                    action[action_idx] = 1
+                    actions.append(action)
+                next_obs, reward, done, info = self.env.step(actions)
+                if render:
+                    self.env.render()
+                total_reward = [total_reward[i] + reward[i] for i in range(self.env.n)]
+                obs = next_obs
+                self.count += 1
+                if any(done) or self.count % self.traj_len == 0:
+                    print('episode: {}\treward: {}'.format(i + 1, total_reward))
+                    break

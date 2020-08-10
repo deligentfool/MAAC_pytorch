@@ -10,15 +10,12 @@ class discrete_policy_net(nn.Module):
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
 
-        self.in_fn = nn.BatchNorm1d(self.input_dim, affine=False)
         self.fc1_layer = nn.Linear(self.input_dim, self.hidden_dim)
         self.fc2_layer = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.fc3_layer = nn.Linear(self.hidden_dim, self.output_dim)
 
 
     def forward(self, input, explore=True, mask=None, log=False, reg=False, entropy=False, all=False):
-        if input.size(0) > 1:
-            input = self.in_fn(input)
         x = F.leaky_relu(self.fc1_layer(input))
         x = F.leaky_relu(self.fc2_layer(x))
         x = self.fc3_layer(x)
